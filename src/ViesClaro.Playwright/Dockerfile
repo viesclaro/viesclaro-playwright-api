@@ -55,9 +55,18 @@ COPY --from=build /app .
 # Diretório dedicado pro Chromium baixado — sobrevive entre layers/runtime.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Baixa Chromium usando o entry-point do package Microsoft.Playwright,
-# que vem como playwright.dll no output do publish.
-RUN dotnet /app/playwright.dll install chromium
+# Baixa Chromium via Microsoft.Playwright CLI. O nome exato do assembly varia
+# por versão (playwright.dll, Microsoft.Playwright.dll, etc.), então procuramos
+# em runtime e usamos o que existir. `dotnet exec` requer runtimeconfig — usamos
+# o do app principal pra rodar o entry-point Microsoft.Playwright.Program.Main.
+RUN ls -la /app | head -30 && \
+    if [ -f /app/playwright.dll ]; then \
+        dotnet /app/playwright.dll install chromium; \
+    elif [ -f /app/Microsoft.Playwright.dll ]; then \
+        dotnet exec --runtimeconfig /app/ViesClaro.Playwright.runtimeconfig.json /app/Microsoft.Playwright.dll install chromium; \
+    else \
+        echo "ERRO: nenhum CLI do Playwright encontrado em /app" && ls -la /app && exit 1; \
+    fi
 
 ENV ASPNETCORE_URLS=http://+:8080 \
     DOTNET_RUNNING_IN_CONTAINER=true \
