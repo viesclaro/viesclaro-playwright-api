@@ -1,0 +1,29 @@
+## .NET
+bin/
+obj/
+out/
+*.user
+*.suo
+.vs/
+
+## VS Code / Rider / Visual Studio
+.idea/
+.vscode/
+*.swp
+
+## Build artifacts
+*.pdb
+*.dll
+*.exe
+
+## Local config (placeholders)
+appsettings.Local.json
+appsettings.Development.json
+
+## OS
+Thumbs.db
+.DS_Store
+
+## Logs
+*.log
+logs/
