@@ -40,7 +40,7 @@ public sealed partial class BrowserPool : IBrowserPool, IDisposable
         ArgumentNullException.ThrowIfNull(request);
 
         var navTimeoutSeconds = ClampTimeout(request.TimeoutSeconds);
-        var waitUntil = ParseWaitUntil(request.WaitUntil);
+        var (waitUntil, postLoadDelayMs) = ParseStrategy(request.WaitUntil);
 
         var waitSw = Stopwatch.StartNew();
         var acquireTimeout = TimeSpan.FromSeconds(_options.AcquireTimeoutSeconds);
@@ -61,7 +61,7 @@ public sealed partial class BrowserPool : IBrowserPool, IDisposable
 
         try
         {
-            return await FetchInternalAsync(request, navTimeoutSeconds, waitUntil, cancellationToken)
+            return await FetchInternalAsync(request, navTimeoutSeconds, waitUntil, postLoadDelayMs, cancellationToken)
                 .ConfigureAwait(false);
         }
         finally
@@ -74,6 +74,7 @@ public sealed partial class BrowserPool : IBrowserPool, IDisposable
         FetchRequest request,
         int navTimeoutSeconds,
         WaitUntilState waitUntil,
+        int postLoadDelayMs,
         CancellationToken cancellationToken)
     {
         LogFetchStarted(request.Url, navTimeoutSeconds);
@@ -116,6 +117,16 @@ public sealed partial class BrowserPool : IBrowserPool, IDisposable
                 Timeout = navTimeoutSeconds * 1000f,
                 WaitUntil = waitUntil,
             }).ConfigureAwait(false);
+
+            // Estratégia "hydrate": espera N segundos depois de DOMContentLoaded
+            // pra hidratação JS terminar (React/Next.js fazem fetch lazy pós-mount).
+            // Mais determinístico que NetworkIdle que nunca estabiliza em sites com
+            // analytics/ads polling contínuo (caso real: o-popular timed out 60s).
+            if (postLoadDelayMs > 0)
+            {
+                LogPostLoadWait(request.Url, postLoadDelayMs);
+                await page.WaitForTimeoutAsync(postLoadDelayMs).ConfigureAwait(false);
+            }
 
             var html = await page.ContentAsync().ConfigureAwait(false);
             sw.Stop();
@@ -169,18 +180,27 @@ public sealed partial class BrowserPool : IBrowserPool, IDisposable
     }
 
     /// <summary>
-    /// Default <c>DOMContentLoaded</c>: HTML montado mas sem esperar ads/analytics
-    /// que pollam continuamente. <c>NetworkIdle</c> raramente estabiliza em sites
-    /// editoriais modernos (Forbes, Next.js com tracking, etc.) e estoura timeout.
-    /// Cliente pode pedir explicitamente outra estratégia via <c>WaitUntil</c>.
+    /// Mapeia a estratégia textual do cliente em <c>(WaitUntilState, postLoadDelayMs)</c>:
+    /// <list type="bullet">
+    ///   <item><c>domcontentloaded</c> (default) — DOM montado, sem delay. ~1-3s.</item>
+    ///   <item><c>load</c> — aguarda <c>window.load</c> (CSS/imgs primárias). ~2-5s.</item>
+    ///   <item><c>networkidle</c> — aguarda 500ms sem requests. Sites com analytics
+    ///   contínuo nunca estabilizam — usar com cuidado.</item>
+    ///   <item><c>hydrate</c> — DOMContentLoaded + delay de 5s pra hidratação JS
+    ///   terminar (React/Next.js fazem fetch lazy pós-mount). Determinístico,
+    ///   recomendado pra SPAs que precisam mostrar conteúdo dinâmico.</item>
+    /// </list>
     /// </summary>
-    private static WaitUntilState ParseWaitUntil(string? raw) => raw?.ToLowerInvariant() switch
-    {
-        "load" => WaitUntilState.Load,
-        "domcontentloaded" or null => WaitUntilState.DOMContentLoaded,
-        "networkidle" => WaitUntilState.NetworkIdle,
-        _ => WaitUntilState.DOMContentLoaded,
-    };
+    private const int HydratePostLoadDelayMs = 5_000;
+    private static (WaitUntilState waitUntil, int postLoadDelayMs) ParseStrategy(string? raw) =>
+        raw?.ToLowerInvariant() switch
+        {
+            "load" => (WaitUntilState.Load, 0),
+            "domcontentloaded" or null => (WaitUntilState.DOMContentLoaded, 0),
+            "networkidle" => (WaitUntilState.NetworkIdle, 0),
+            "hydrate" => (WaitUntilState.DOMContentLoaded, HydratePostLoadDelayMs),
+            _ => (WaitUntilState.DOMContentLoaded, 0),
+        };
 
     public void Dispose() => _semaphore.Dispose();
 
@@ -211,4 +231,8 @@ public sealed partial class BrowserPool : IBrowserPool, IDisposable
     [LoggerMessage(Level = LogLevel.Error,
         Message = "BrowserPool saturation timeout — falhou em adquirir slot em {WaitMs}ms para {Url}")]
     private partial void LogPoolSaturationTimeout(string url, long waitMs);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Hydration wait {DelayMs}ms after DOMContentLoaded for {Url}")]
+    private partial void LogPostLoadWait(string url, int delayMs);
 }
