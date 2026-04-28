@@ -10,23 +10,24 @@
 # Aceitável dado que o crash isolation do browser justifica o serviço separado.
 
 # --- Build stage ---
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+ARG DOTNET_VERSION=10.0
+FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION} AS build
+ARG GITHUB_USERNAME
+ARG GITHUB_TOKEN
 WORKDIR /src
 
 # 1. Copy package descriptors first pra cache de restore
-COPY ["Directory.Packages.props", "Directory.Build.props", "nuget.config", "./"]
-COPY ["src/ViesClaro.Playwright/ViesClaro.Playwright.csproj", "src/ViesClaro.Playwright/"]
+COPY nuget.config Directory.Build.props Directory.Packages.props ./
+COPY src/ViesClaro.Playwright/ViesClaro.Playwright.csproj src/ViesClaro.Playwright/
 
-# 2. Restore — GITHUB_USERNAME e GITHUB_TOKEN vêm via --secret no build (CD)
-RUN --mount=type=secret,id=GITHUB_USERNAME \
-    --mount=type=secret,id=GITHUB_TOKEN \
-    GITHUB_USERNAME=$(cat /run/secrets/GITHUB_USERNAME) \
-    GITHUB_TOKEN=$(cat /run/secrets/GITHUB_TOKEN) \
-    dotnet restore "src/ViesClaro.Playwright/ViesClaro.Playwright.csproj"
+# 2. Restore — GITHUB_USERNAME e GITHUB_TOKEN vêm via --build-arg no CD
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet restore src/ViesClaro.Playwright/ViesClaro.Playwright.csproj
 
 # 3. Build + publish
 COPY src/ViesClaro.Playwright/ src/ViesClaro.Playwright/
-RUN dotnet publish "src/ViesClaro.Playwright/ViesClaro.Playwright.csproj" \
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet publish src/ViesClaro.Playwright/ViesClaro.Playwright.csproj \
     -c Release \
     -o /app \
     /p:UseAppHost=false
