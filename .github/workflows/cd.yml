@@ -60,8 +60,14 @@ jobs:
 
       - name: Trigger Dokploy deploy
         if: success() && vars.DOKPLOY_PLAYWRIGHT_APP_ID != ''
+        # Dokploy roda em IP privado (192.168.x) inacessível pelo runner público.
+        # O auto-deploy do Dokploy (poll do GHCR :latest) cobre o caso onde este
+        # webhook falha — então não bloqueamos o pipeline. Connect timeout curto
+        # (10s) pra evitar adicionar 2min de espera quando o IP não responde.
+        continue-on-error: true
         run: |
-          curl -fsSL -X POST "${{ secrets.DOKPLOY_URL }}/application.deploy" \
+          curl -fsSL --connect-timeout 10 -X POST "${{ secrets.DOKPLOY_URL }}/application.deploy" \
             -H "x-api-key: ${{ secrets.DOKPLOY_API_KEY }}" \
             -H "Content-Type: application/json" \
-            -d "{\"applicationId\":\"${{ vars.DOKPLOY_PLAYWRIGHT_APP_ID }}\"}"
+            -d "{\"applicationId\":\"${{ vars.DOKPLOY_PLAYWRIGHT_APP_ID }}\"}" \
+            || echo "::warning::Webhook Dokploy não acessível do runner público — auto-deploy via :latest poll cobre."
