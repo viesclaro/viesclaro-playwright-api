@@ -2,12 +2,12 @@
 #
 # Multi-stage build pra viesclaro-playwright-api.
 #
-# Stage 1 (build): SDK 10 puro pra restore/build/publish.
-# Stage 2 (final): imagem oficial mcr.microsoft.com/playwright/dotnet com
-#   .NET 10 runtime + Chromium + dependências nativas pré-instaladas.
+# A imagem oficial mcr.microsoft.com/playwright/dotnet ainda usa .NET 8 LTS,
+# então optamos por aspnet:10.0 (que bate com TargetFramework do projeto)
+# + instalação manual das deps nativas de Chromium + download do browser
+# via Microsoft.Playwright CLI (incluído no publish output).
 #
-# A imagem final fica grande (~800MB) por causa do Chromium e libs.
-# Aceitável dado que o crash isolation do browser justifica o serviço separado.
+# Imagem final ~700-800MB. Aceitável pelo isolamento + paridade de versão.
 
 # --- Build stage ---
 ARG DOTNET_VERSION=10.0
@@ -28,24 +28,40 @@ RUN --mount=type=cache,target=/root/.nuget/packages \
 COPY src/ViesClaro.Playwright/ src/ViesClaro.Playwright/
 RUN --mount=type=cache,target=/root/.nuget/packages \
     dotnet publish src/ViesClaro.Playwright/ViesClaro.Playwright.csproj \
-    -c Release \
-    -o /app \
-    /p:UseAppHost=false
+        -c Release \
+        -o /app \
+        /p:UseAppHost=false
 
-# --- Runtime stage ---
-# Imagem oficial Microsoft com Chromium pré-instalado e .NET 10 runtime.
-# Tag versionada deve bater com Microsoft.Playwright em Directory.Packages.props.
-FROM mcr.microsoft.com/playwright/dotnet:v1.49.0-noble AS final
+# --- Runtime stage: aspnet:10.0 + Chromium ---
+FROM mcr.microsoft.com/dotnet/aspnet:${DOTNET_VERSION} AS final
 WORKDIR /app
+
+# Lista de deps nativas de Chromium derivada de `playwright install-deps`
+# (https://github.com/microsoft/playwright/blob/main/packages/playwright-core/src/server/registry/nativeDeps.ts).
+# libasound2t64 é o package em Ubuntu 24 (noble) — versão antiga é libasound2.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 libnspr4 libdbus-1-3 \
+    libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 \
+    libcups2t64 libdrm2 libxkbcommon0 \
+    libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+    libgbm1 libpango-1.0-0 libcairo2 \
+    libasound2t64 \
+    fonts-liberation libcurl4t64 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy do build stage
 COPY --from=build /app .
 
-# Config do ambiente
+# Diretório dedicado pro Chromium baixado — sobrevive entre layers/runtime.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Baixa Chromium usando o entry-point do package Microsoft.Playwright,
+# que vem como playwright.dll no output do publish.
+RUN dotnet /app/playwright.dll install chromium
+
 ENV ASPNETCORE_URLS=http://+:8080 \
     DOTNET_RUNNING_IN_CONTAINER=true \
-    DOTNET_GCConserveMemory=9 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    DOTNET_GCConserveMemory=9
 
 EXPOSE 8080
 
