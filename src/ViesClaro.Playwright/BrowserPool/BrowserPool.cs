@@ -1,0 +1,195 @@
+using System.Diagnostics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Microsoft.Playwright;
+using ViesClaro.Playwright.Fetch;
+
+namespace ViesClaro.Playwright.BrowserPool;
+
+/// <summary>
+/// Implementação default do <see cref="IBrowserPool"/>. Cada request abre um
+/// <c>IBrowserContext</c> efêmero (cookies/storage isolados → sem leakage entre
+/// fontes), navega via Playwright e fecha. Concorrência limitada por
+/// <see cref="SemaphoreSlim"/> dimensionado por <see cref="BrowserPoolOptions.MaxConcurrency"/>.
+/// </summary>
+public sealed partial class BrowserPool : IBrowserPool, IDisposable
+{
+    private const long SaturationWarningThresholdMs = 5_000;
+
+    private readonly IBrowserProvider _browserProvider;
+    private readonly BrowserPoolOptions _options;
+    private readonly ILogger<BrowserPool> _logger;
+    private readonly TimeProvider _timeProvider;
+    private readonly SemaphoreSlim _semaphore;
+
+    public BrowserPool(
+        IBrowserProvider browserProvider,
+        IOptions<BrowserPoolOptions> options,
+        TimeProvider timeProvider,
+        ILogger<BrowserPool> logger)
+    {
+        _browserProvider = browserProvider;
+        _options = options.Value;
+        _timeProvider = timeProvider;
+        _logger = logger;
+        _semaphore = new SemaphoreSlim(_options.MaxConcurrency, _options.MaxConcurrency);
+    }
+
+    public async Task<FetchResult> FetchAsync(FetchRequest request, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var navTimeoutSeconds = ClampTimeout(request.TimeoutSeconds);
+        var waitUntil = ParseWaitUntil(request.WaitUntil);
+
+        var waitSw = Stopwatch.StartNew();
+        var acquireTimeout = TimeSpan.FromSeconds(_options.AcquireTimeoutSeconds);
+        var acquired = await _semaphore.WaitAsync(acquireTimeout, cancellationToken).ConfigureAwait(false);
+        waitSw.Stop();
+
+        if (!acquired)
+        {
+            LogPoolSaturationTimeout(request.Url, waitSw.ElapsedMilliseconds);
+            throw new TimeoutException(
+                $"Browser pool saturado: aquisição não completou em {acquireTimeout.TotalSeconds:F0}s. Cliente pode retentar.");
+        }
+
+        if (waitSw.ElapsedMilliseconds >= SaturationWarningThresholdMs)
+        {
+            LogPoolSaturationSlow(request.Url, waitSw.ElapsedMilliseconds);
+        }
+
+        try
+        {
+            return await FetchInternalAsync(request, navTimeoutSeconds, waitUntil, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
+    private async Task<FetchResult> FetchInternalAsync(
+        FetchRequest request,
+        int navTimeoutSeconds,
+        WaitUntilState waitUntil,
+        CancellationToken cancellationToken)
+    {
+        LogFetchStarted(request.Url, navTimeoutSeconds);
+
+        var sw = Stopwatch.StartNew();
+        IBrowserContext? context = null;
+        try
+        {
+            context = await _browserProvider.Browser.NewContextAsync(new BrowserNewContextOptions
+            {
+                UserAgent = _options.UserAgent,
+                Locale = _options.Locale,
+                ViewportSize = new ViewportSize
+                {
+                    Width = _options.ViewportWidth,
+                    Height = _options.ViewportHeight,
+                },
+                ExtraHTTPHeaders = new Dictionary<string, string>
+                {
+                    ["Accept-Language"] = "pt-BR,pt;q=0.9,en;q=0.8",
+                },
+            }).ConfigureAwait(false);
+
+            var page = await context.NewPageAsync().ConfigureAwait(false);
+            var response = await page.GotoAsync(request.Url, new PageGotoOptions
+            {
+                Timeout = navTimeoutSeconds * 1000f,
+                WaitUntil = waitUntil,
+            }).ConfigureAwait(false);
+
+            var html = await page.ContentAsync().ConfigureAwait(false);
+            sw.Stop();
+
+            var statusCode = response?.Status ?? 0;
+            LogFetchCompleted(request.Url, statusCode, sw.ElapsedMilliseconds);
+
+            return new FetchResult
+            {
+                Url = request.Url,
+                FinalUrl = page.Url,
+                StatusCode = statusCode,
+                Html = html,
+                DurationMs = sw.ElapsedMilliseconds,
+                FetchedAt = _timeProvider.GetUtcNow(),
+            };
+        }
+        catch (TimeoutException ex)
+        {
+            sw.Stop();
+            LogFetchTimeout(request.Url, sw.ElapsedMilliseconds);
+            throw new TimeoutException(
+                $"Navegação para {request.Url} estourou {navTimeoutSeconds}s.", ex);
+        }
+        catch (PlaywrightException ex)
+        {
+            sw.Stop();
+            LogFetchPlaywrightFailed(request.Url, sw.ElapsedMilliseconds, ex.Message);
+            throw;
+        }
+        finally
+        {
+            if (context is not null)
+            {
+                try
+                {
+                    await context.CloseAsync().ConfigureAwait(false);
+                }
+                catch (Exception closeEx)
+                {
+                    LogContextCloseFailed(request.Url, closeEx.Message);
+                }
+            }
+        }
+    }
+
+    private int ClampTimeout(int? requested)
+    {
+        var value = requested ?? _options.DefaultNavTimeoutSeconds;
+        return Math.Clamp(value, 1, _options.MaxNavTimeoutSeconds);
+    }
+
+    private static WaitUntilState ParseWaitUntil(string? raw) => raw?.ToLowerInvariant() switch
+    {
+        "load" => WaitUntilState.Load,
+        "domcontentloaded" => WaitUntilState.DOMContentLoaded,
+        "networkidle" or null => WaitUntilState.NetworkIdle,
+        _ => WaitUntilState.NetworkIdle,
+    };
+
+    public void Dispose() => _semaphore.Dispose();
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Fetch started {Url} timeoutSeconds={TimeoutSeconds}")]
+    private partial void LogFetchStarted(string url, int timeoutSeconds);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Fetch completed {Url} statusCode={StatusCode} durationMs={DurationMs}")]
+    private partial void LogFetchCompleted(string url, int statusCode, long durationMs);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Fetch timeout {Url} after {DurationMs}ms")]
+    private partial void LogFetchTimeout(string url, long durationMs);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Fetch failed {Url} after {DurationMs}ms reason={Reason}")]
+    private partial void LogFetchPlaywrightFailed(string url, long durationMs, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Context.CloseAsync threw for {Url} reason={Reason} — pode deixar resources zumbi até reciclagem do browser")]
+    private partial void LogContextCloseFailed(string url, string reason);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "BrowserPool saturation — waited {WaitMs}ms for slot before fetching {Url}")]
+    private partial void LogPoolSaturationSlow(string url, long waitMs);
+
+    [LoggerMessage(Level = LogLevel.Error,
+        Message = "BrowserPool saturation timeout — falhou em adquirir slot em {WaitMs}ms para {Url}")]
+    private partial void LogPoolSaturationTimeout(string url, long waitMs);
+}
