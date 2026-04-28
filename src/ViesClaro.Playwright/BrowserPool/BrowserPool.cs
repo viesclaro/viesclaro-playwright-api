@@ -97,6 +97,19 @@ public sealed partial class BrowserPool : IBrowserPool, IDisposable
                 },
             }).ConfigureAwait(false);
 
+            // Mascara fingerprints óbvios de Chromium headless. Cobre os checks
+            // mais comuns (navigator.webdriver, navigator.plugins.length=0,
+            // navigator.languages vazio) que sites tipo Cloudflare/Akamai usam
+            // pra rejeitar bots ANTES do JS challenge real. Caso real (28-04):
+            // correio24horas.com.br e noticias.uol.com.br retornavam 403 mesmo
+            // com Chromium real headless até este script ser injetado.
+            await context.AddInitScriptAsync(@"
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en'] });
+                window.chrome = { runtime: {} };
+            ").ConfigureAwait(false);
+
             var page = await context.NewPageAsync().ConfigureAwait(false);
             var response = await page.GotoAsync(request.Url, new PageGotoOptions
             {
@@ -155,12 +168,18 @@ public sealed partial class BrowserPool : IBrowserPool, IDisposable
         return Math.Clamp(value, 1, _options.MaxNavTimeoutSeconds);
     }
 
+    /// <summary>
+    /// Default <c>DOMContentLoaded</c>: HTML montado mas sem esperar ads/analytics
+    /// que pollam continuamente. <c>NetworkIdle</c> raramente estabiliza em sites
+    /// editoriais modernos (Forbes, Next.js com tracking, etc.) e estoura timeout.
+    /// Cliente pode pedir explicitamente outra estratégia via <c>WaitUntil</c>.
+    /// </summary>
     private static WaitUntilState ParseWaitUntil(string? raw) => raw?.ToLowerInvariant() switch
     {
         "load" => WaitUntilState.Load,
-        "domcontentloaded" => WaitUntilState.DOMContentLoaded,
-        "networkidle" or null => WaitUntilState.NetworkIdle,
-        _ => WaitUntilState.NetworkIdle,
+        "domcontentloaded" or null => WaitUntilState.DOMContentLoaded,
+        "networkidle" => WaitUntilState.NetworkIdle,
+        _ => WaitUntilState.DOMContentLoaded,
     };
 
     public void Dispose() => _semaphore.Dispose();
