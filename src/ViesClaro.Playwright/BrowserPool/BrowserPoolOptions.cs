@@ -8,8 +8,12 @@ public sealed class BrowserPoolOptions
 {
     public const string SectionName = "BrowserPool";
 
-    /// <summary>Quantidade máxima de fetches simultâneos (semaphore size).</summary>
-    public int MaxConcurrency { get; set; } = 3;
+    /// <summary>
+    /// Quantidade máxima de fetches simultâneos (semaphore size). Default 5 cobre
+    /// 5 fontes piloto + folga pra DrainLinks pumping artigos individuais. RAM
+    /// estimada: ~250MB/contexto × 5 = ~1.25GB pico (config Dokploy: limite 2GB).
+    /// </summary>
+    public int MaxConcurrency { get; set; } = 5;
 
     /// <summary>Tempo máximo aguardando vaga no semaphore antes de retornar 503.</summary>
     public int AcquireTimeoutSeconds { get; set; } = 60;
