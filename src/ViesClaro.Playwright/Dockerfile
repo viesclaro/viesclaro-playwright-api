@@ -36,10 +36,11 @@ RUN --mount=type=cache,target=/root/.nuget/packages \
 FROM mcr.microsoft.com/dotnet/aspnet:${DOTNET_VERSION} AS final
 WORKDIR /app
 
-# Lista de deps nativas de Chromium derivada de `playwright install-deps`
-# (https://github.com/microsoft/playwright/blob/main/packages/playwright-core/src/server/registry/nativeDeps.ts).
+# Lista de deps nativas de Chromium derivada de `playwright install-deps`.
 # libasound2t64 é o package em Ubuntu 24 (noble) — versão antiga é libasound2.
+# wget+gnupg adicionados pra baixar GPG key do Google e instalar Chrome stable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget gnupg ca-certificates \
     libnss3 libnspr4 libdbus-1-3 \
     libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 \
     libcups2t64 libdrm2 libxkbcommon0 \
@@ -49,18 +50,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation libcurl4t64 \
     && rm -rf /var/lib/apt/lists/*
 
+# Google Chrome stable. Detecção de bot via TLS fingerprint (JA3/JA4) é mais
+# fácil de quebrar com Chrome real do que Chromium open-source — Cloudflare
+# (correio24horas.com.br) e Akamai (noticias.uol.com.br) rejeitavam Chromium
+# headless mesmo com mascaramento de navigator.webdriver.
+# Baixamos via repo oficial Google + apt instala google-chrome-stable.
+# Usamos arch=amd64 explicitamente porque o Dokploy server roda x86_64.
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor > /etc/apt/trusted.gpg.d/google-chrome.gpg \
+    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy do build stage
 COPY --from=build /app .
 
 # Diretório dedicado pro Chromium baixado — sobrevive entre layers/runtime.
+# Mantemos Chromium baixado também pra ter fallback se Chrome stable bugar.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # Baixa Chromium via Microsoft.Playwright CLI. O nome exato do assembly varia
 # por versão (playwright.dll, Microsoft.Playwright.dll, etc.), então procuramos
 # em runtime e usamos o que existir. `dotnet exec` requer runtimeconfig — usamos
 # o do app principal pra rodar o entry-point Microsoft.Playwright.Program.Main.
-RUN ls -la /app | head -30 && \
-    if [ -f /app/playwright.dll ]; then \
+# Usamos chromium como fallback; o default em produção é Chrome stable do apt
+# (configurável via env var BrowserPool__BrowserChannel).
+RUN if [ -f /app/playwright.dll ]; then \
         dotnet /app/playwright.dll install chromium; \
     elif [ -f /app/Microsoft.Playwright.dll ]; then \
         dotnet exec --runtimeconfig /app/ViesClaro.Playwright.runtimeconfig.json /app/Microsoft.Playwright.dll install chromium; \
